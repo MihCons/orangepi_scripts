@@ -83,18 +83,40 @@ def update_thingspeak(data):
         print(f"ThingSpeak error: {e}")
         return False
 
-def adjust_led_brightness(goal_lux):
-    brightness = max(0, min(100, (goal_lux / 353.3) * 100))
-    wiringpi.softPwmWrite(LED_PIN, int(brightness))
+def adjust_led_brightness(goal_lux, current_lux, current_brightness):
+    # If we don't have a light reading, use a simple proportional value
+    if current_lux is None:
+        brightness = max(0, min(100, (goal_lux / 294) * 100))
+        wiringpi.softPwmWrite(LED_PIN, int(brightness))
+        return brightness
+    
+    # If we have a light reading, adjust based on the difference
+    error = goal_lux - current_lux
+    
+    # If we're below the goal, continuously increase brightness
+    if error > 2:  # We're below the goal
+        # Increase proportionally to the error, with a minimum step
+        adjustment = max(1, min(10, abs(error) / 5))
+        new_brightness = current_brightness + adjustment
+    # If we're above the goal, decrease brightness
+    elif error < -2:  # We're above the goal
+        adjustment = max(1, min(10, abs(error) / 5))
+        new_brightness = current_brightness - adjustment
+    # If we're within 2 lux of the goal, maintain current brightness
+    else:
+        new_brightness = current_brightness
+    
+    # Ensure brightness stays within valid range
+    new_brightness = max(0, min(100, new_brightness))
+    wiringpi.softPwmWrite(LED_PIN, int(new_brightness))
+    return new_brightness
 
 def control_heating(goal_temp, current_temp):
     if current_temp is not None:
         if current_temp < goal_temp:
             wiringpi.digitalWrite(HEATER_RELAY_PIN, 0)  # ON
-            print(f"Heating ON: {current_temp}°C < {goal_temp}°C")
         else:
             wiringpi.digitalWrite(HEATER_RELAY_PIN, 1)  # OFF
-            print(f"Heating OFF: {current_temp}°C >= {goal_temp}°C")
     else:
         wiringpi.digitalWrite(HEATER_RELAY_PIN, 1)  # OFF
         print("No temperature data, heater off")
@@ -103,21 +125,19 @@ def check_buttons(goal_temp, goal_lux):
     # Check buttons to adjust goals
     if wiringpi.digitalRead(BUTTON_PINS[0]) == wiringpi.LOW:  # Temp Up
         goal_temp += 1
-        print(f"Temperature goal: {goal_temp}°C")
+        print(f"Temperature goal: {int(goal_temp)}°C")
         
     if wiringpi.digitalRead(BUTTON_PINS[1]) == wiringpi.LOW:  # Temp Down
         goal_temp -= 1
-        print(f"Temperature goal: {goal_temp}°C")
+        print(f"Temperature goal: {int(goal_temp)}°C")
         
     if wiringpi.digitalRead(BUTTON_PINS[2]) == wiringpi.LOW:  # Lux Up
-        goal_lux += 1
-        adjust_led_brightness(goal_lux)
-        print(f"Light goal: {goal_lux} lux")
+        goal_lux += 10
+        print(f"Light goal: {int(goal_lux)} lux")
         
     if wiringpi.digitalRead(BUTTON_PINS[3]) == wiringpi.LOW:  # Lux Down
-        goal_lux -= 1
-        adjust_led_brightness(goal_lux)
-        print(f"Light goal: {goal_lux} lux")
+        goal_lux = max(0, goal_lux - 10)
+        print(f"Light goal: {int(goal_lux)} lux")
     
     return goal_temp, goal_lux
 
@@ -128,8 +148,10 @@ def main():
     send_interval = 10  # seconds
     
     # Get initial sensor values to set as goals
-    goal_temp = read_temp_sensor(bus) if read_temp_sensor(bus) is not None else 0
-    goal_lux = read_light_sensor(bus) if read_light_sensor(bus) is not None else 0
+    goal_temp = read_temp_sensor(bus) if read_temp_sensor(bus) is not None else 22
+    initial_lux = read_light_sensor(bus)
+    goal_lux = initial_lux if initial_lux is not None else 100
+    current_brightness = 50  # Start at 50% brightness
     
     print("=== Sensor Control ===")
     print("Use buttons to adjust temperature and light goals")
@@ -143,11 +165,18 @@ def main():
             temp = read_temp_sensor(bus)
             light = read_light_sensor(bus)
             
+            # Adjust LED brightness based on goal and current light level
+            current_brightness = adjust_led_brightness(goal_lux, light, current_brightness)
+            
+            # Control heating based on temperature
+            control_heating(goal_temp, temp)
+            
             # Display current readings
             os.system('clear')
             print("=== SENSOR READINGS ===")
-            print(f"Temperature: {temp}°C (Goal: {goal_temp}°C)")
-            print(f"Light: {light} lux (Goal: {goal_lux} lux)")
+            print(f"Temperature: {temp}°C (Goal: {int(goal_temp)}°C)")
+            print(f"Light: {light} lux (Goal: {int(goal_lux)} lux)")
+
             
             # Send data to ThingSpeak every 10 seconds
             current_time = time.time()
@@ -157,12 +186,9 @@ def main():
                     'field1': temp, 
                     'field2': light, 
                     'field3': goal_temp, 
-                    'field4': goal_lux
+                    'field4': goal_lux,
+                    'field5': current_brightness
                 })
-            
-            # Control devices
-            adjust_led_brightness(goal_lux)
-            control_heating(goal_temp, temp)
             
             time.sleep(0.1)  # Small delay to prevent CPU overuse
             

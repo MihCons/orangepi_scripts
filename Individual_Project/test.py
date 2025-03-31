@@ -1,15 +1,24 @@
 import time
 import os
-import requests
+import paho.mqtt.client as mqtt
 from smbus2 import SMBus, i2c_msg
 import wiringpi
 
-# Configuration
-THINGSPEAK_API_KEY = "1A8WQET2BFB6V6QJ"
-THINGSPEAK_URL = "https://api.thingspeak.com/update"
+# MQTT Configuration
+MQTT_HOST = "mqtt3.thingspeak.com"
+MQTT_PORT = 1883
+MQTT_KEEPALIVE_INTERVAL = 60
+MQTT_TOPIC = "channels/2898460/publish"  # Replace with your ThingSpeak channel details
+MQTT_CLIENT_ID = "MSgnIBw4IhMFAQ8fOgMRCRs"
+MQTT_USER = "MSgnIBw4IhMFAQ8fOgMRCRs"
+MQTT_PWD = "OX/hTI1t6r2utzp/gRhBHYus"
+
+# I2C Configuration
 I2C_BUS = 0
 BMP280_ADDRESS = 0x77
 BH1750_ADDRESS = 0x23
+
+# GPIO Configuration
 LED_PIN = 3
 HEATER_RELAY_PIN = 5
 BUTTON_PINS = [7, 8, 11, 12]  # [Temp Up, Temp Down, Lux Up, Lux Down]
@@ -19,160 +28,76 @@ wiringpi.wiringPiSetup()
 wiringpi.softPwmCreate(LED_PIN, 0, 100)
 wiringpi.pinMode(HEATER_RELAY_PIN, 1)
 
-# Set button pins as input with pull-up resistors
 for pin in BUTTON_PINS:
-    wiringpi.pinMode(pin, 0)  # INPUT
+    wiringpi.pinMode(pin, 0)
     wiringpi.pullUpDnControl(pin, wiringpi.PUD_UP)
+
+# MQTT Client Setup
+client = mqtt.Client(MQTT_CLIENT_ID)
+client.username_pw_set(MQTT_USER, MQTT_PWD)
+
+def on_connect(client, userdata, flags, rc, properties=None):
+    if rc == 0:
+        print("Connected to MQTT Broker")
+    else:
+        print(f"Failed to connect, return code {rc}")
+
+def on_disconnect(client, userdata, flags, rc=0):
+    print(f"Disconnected, result code {rc}")
+
+client.on_connect = on_connect
+client.on_disconnect = on_disconnect
+print(f"Connecting to MQTT Broker at {MQTT_HOST}...")
+client.connect(MQTT_HOST, MQTT_PORT, MQTT_KEEPALIVE_INTERVAL)
+client.loop_start()
 
 def read_light_sensor(bus):
     try:
-        bus.i2c_rdwr(i2c_msg.write(BH1750_ADDRESS, [0x10]))  # Set high-resolution mode
+        bus.i2c_rdwr(i2c_msg.write(BH1750_ADDRESS, [0x10]))
         time.sleep(0.2)
-        
         read_msg = i2c_msg.read(BH1750_ADDRESS, 2)
         bus.i2c_rdwr(read_msg)
-        
         bytes_read = list(read_msg)
-        lux = ((bytes_read[0] << 8) + bytes_read[1]) / 1.2
-        return round(lux, 2)
+        return round(((bytes_read[0] << 8) + bytes_read[1]) / 1.2, 2)
     except Exception as e:
         print(f"Error reading light sensor: {e}")
         return None
 
 def read_temp_sensor(bus):
     try:
-        # Initialize sensor - normal mode with 1x oversampling
         bus.write_byte_data(BMP280_ADDRESS, 0xF4, 0x27)
         time.sleep(0.1)
-        
-        # Read raw temperature data
         raw_temp = bus.read_i2c_block_data(BMP280_ADDRESS, 0xFA, 3)
         raw_temp = ((raw_temp[0] << 12) | (raw_temp[1] << 4) | (raw_temp[2] >> 4))
-        
-        # Read calibration parameters
-        cal_params = bus.read_i2c_block_data(BMP280_ADDRESS, 0x88, 6)
-        
-        # Calculate temperature using calibration coefficients
-        dig_T1 = (cal_params[1] << 8) | cal_params[0]
-        dig_T2 = (cal_params[3] << 8) | cal_params[2]
-        dig_T3 = (cal_params[5] << 8) | cal_params[4]
-        
-        # Apply calibration
-        var1 = ((raw_temp / 16384.0) - (dig_T1 / 1024.0)) * dig_T2
-        var2 = ((raw_temp / 131072.0) - (dig_T1 / 8192.0)) * ((raw_temp / 131072.0) - (dig_T1 / 8192.0)) * dig_T3
-        temperature = (var1 + var2) / 5120.0
-        
-        return round(temperature, 2)
+        return round(raw_temp / 5120.0, 2)  # Simplified calculation
     except Exception as e:
         print(f"Error reading temperature sensor: {e}")
         return None
 
-def update_thingspeak(data):
-    params = {'api_key': THINGSPEAK_API_KEY}
-    params.update({field: value for field, value in data.items() if value is not None})
-    
-    try:
-        response = requests.get(THINGSPEAK_URL, params=params)
-        if response.ok:
-            print(f"Data successfully sent to ThingSpeak")
-            return True
-        else:
-            print(f"Error sending to ThingSpeak: {response.status_code}")
-            return False
-    except Exception as e:
-        print(f"ThingSpeak error: {e}")
-        return False
-
-def adjust_led_brightness(goal_lux):
-    brightness = max(0, min(100, (goal_lux / 353.3) * 100))
-    wiringpi.softPwmWrite(LED_PIN, int(brightness))
-
-def control_heating(goal_temp, current_temp):
-    if current_temp is not None:
-        if current_temp < goal_temp:
-            wiringpi.digitalWrite(HEATER_RELAY_PIN, 0)  # ON
-            print(f"Heating ON: {current_temp}°C < {goal_temp}°C")
-        else:
-            wiringpi.digitalWrite(HEATER_RELAY_PIN, 1)  # OFF
-            print(f"Heating OFF: {current_temp}°C >= {goal_temp}°C")
-    else:
-        wiringpi.digitalWrite(HEATER_RELAY_PIN, 1)  # OFF
-        print("No temperature data, heater off")
-
-def check_buttons(goal_temp, goal_lux):
-    # Check buttons to adjust goals
-    if wiringpi.digitalRead(BUTTON_PINS[0]) == wiringpi.LOW:  # Temp Up
-        goal_temp += 1
-        print(f"Temperature goal: {goal_temp}°C")
-        
-    if wiringpi.digitalRead(BUTTON_PINS[1]) == wiringpi.LOW:  # Temp Down
-        goal_temp -= 1
-        print(f"Temperature goal: {goal_temp}°C")
-        
-    if wiringpi.digitalRead(BUTTON_PINS[2]) == wiringpi.LOW:  # Lux Up
-        goal_lux += 1
-        adjust_led_brightness(goal_lux)
-        print(f"Light goal: {goal_lux} lux")
-        
-    if wiringpi.digitalRead(BUTTON_PINS[3]) == wiringpi.LOW:  # Lux Down
-        goal_lux -= 1
-        adjust_led_brightness(goal_lux)
-        print(f"Light goal: {goal_lux} lux")
-    
-    return goal_temp, goal_lux
+def publish_data(temp, light, goal_temp, goal_lux, brightness):
+    payload = f"field1={temp}&field2={light}&field3={goal_temp}&field4={goal_lux}&field5={brightness}&status=MQTTPUBLISH"
+    print("Publishing data:", payload)
+    client.publish(MQTT_TOPIC, payload, qos=0)
 
 def main():
-    # Initialize hardware
     bus = SMBus(I2C_BUS)
-    last_send_time = time.time()
-    send_interval = 10  # seconds
-    
-    # Get initial sensor values to set as goals
-    goal_temp = read_temp_sensor(bus) if read_temp_sensor(bus) is not None else 0
-    goal_lux = read_light_sensor(bus) if read_light_sensor(bus) is not None else 0
-    
-    print("=== Sensor Control ===")
-    print("Use buttons to adjust temperature and light goals")
+    goal_temp = 22
+    goal_lux = 100
+    current_brightness = 50
     
     try:
         while True:
-            # Check for button presses and update goals
-            goal_temp, goal_lux = check_buttons(goal_temp, goal_lux)
-            
-            # Read sensors
             temp = read_temp_sensor(bus)
             light = read_light_sensor(bus)
-            
-            # Display current readings
-            os.system('clear')
-            print("=== SENSOR READINGS ===")
-            print(f"Temperature: {temp}°C (Goal: {goal_temp}°C)")
-            print(f"Light: {light} lux (Goal: {goal_lux} lux)")
-            
-            # Send data to ThingSpeak every 10 seconds
-            current_time = time.time()
-            if current_time - last_send_time >= send_interval:
-                last_send_time = current_time
-                update_thingspeak({
-                    'field1': temp, 
-                    'field2': light, 
-                    'field3': goal_temp, 
-                    'field4': goal_lux
-                })
-            
-            # Control devices
-            adjust_led_brightness(goal_lux)
-            control_heating(goal_temp, temp)
-            
-            time.sleep(0.1)  # Small delay to prevent CPU overuse
-            
+            publish_data(temp, light, goal_temp, goal_lux, current_brightness)
+            time.sleep(15)
     except KeyboardInterrupt:
-        print("\nStopped by user")
+        print("Stopping...")
     finally:
         bus.close()
-        wiringpi.digitalWrite(HEATER_RELAY_PIN, 1)  # Turn off heater
-        wiringpi.softPwmWrite(LED_PIN, 0)  # Turn off LED
-        print("Cleanup completed")
+        wiringpi.digitalWrite(HEATER_RELAY_PIN, 1)
+        wiringpi.softPwmWrite(LED_PIN, 0)
+        print("Cleanup complete")
 
 if __name__ == "__main__":
     main()
